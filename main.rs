@@ -807,9 +807,9 @@ impl Buffer {
 //  TERMINAL PANE
 // ══════════════════════════════════════════════════════════════════════════════
 
-struct TermPane { lines: Vec<String>, input: String, scroll: usize }
+struct TermPane { lines: Vec<String>, input: String }
 impl TermPane {
-    fn new() -> Self { TermPane { lines: vec![], input: String::new(), scroll: 0 } }
+    fn new() -> Self { TermPane { lines: vec![], input: String::new() } }
     fn run_command(&mut self, cmd: &str) {
         let prompt = format!("❯ {}", cmd);
         self.lines.push(prompt);
@@ -1492,7 +1492,7 @@ impl App {
     fn on_dashboard(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             // quit
-            (KeyCode::Char('q'), _) | (KeyCode::Char('q'), KeyModifiers::CONTROL) => return true,
+            (KeyCode::Char('q'), _) => return true,
 
             // new empty file → normal mode
             (KeyCode::Char('n'), _) => {
