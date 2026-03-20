@@ -176,36 +176,52 @@ impl Buffer {
     fn save_as(&mut self, path: PathBuf) -> io::Result<()> {
         self.path = Some(path); self.save()
     }
+    /// Convert a char-index to a byte-index for a given line string.
+    fn char_to_byte(line: &str, char_idx: usize) -> usize {
+        line.char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(line.len())
+    }
+
     fn insert_char(&mut self, c: char) {
         let (row, col) = (self.cursor_row, self.cursor_col);
         if row >= self.lines.len() { self.lines.push(String::new()); }
-        let idx = col.min(self.lines[row].len());
-        self.lines[row].insert(idx, c);
+        let char_count = self.lines[row].chars().count();
+        let col = col.min(char_count);
+        let byte_idx = Self::char_to_byte(&self.lines[row], col);
+        self.lines[row].insert(byte_idx, c);
         self.cursor_col += 1; self.dirty = true;
     }
     fn insert_newline(&mut self) {
-        let (row, col) = (self.cursor_row, self.cursor_col.min(self.lines[self.cursor_row].len()));
-        let rest = self.lines[row].split_off(col);
+        let row = self.cursor_row;
+        let char_count = self.lines[row].chars().count();
+        let col = self.cursor_col.min(char_count);
+        let byte_idx = Self::char_to_byte(&self.lines[row], col);
+        let rest = self.lines[row].split_off(byte_idx);
         self.lines.insert(row + 1, rest);
         self.cursor_row += 1; self.cursor_col = 0; self.dirty = true;
     }
     fn backspace(&mut self) {
         if self.cursor_col > 0 {
             let (row, col) = (self.cursor_row, self.cursor_col);
-            self.lines[row].remove(col - 1);
+            let byte_idx = Self::char_to_byte(&self.lines[row], col - 1);
+            self.lines[row].remove(byte_idx);
             self.cursor_col -= 1; self.dirty = true;
         } else if self.cursor_row > 0 {
             let row = self.cursor_row;
             let cur = self.lines.remove(row);
-            let prev_len = self.lines[row - 1].len();
+            let prev_char_len = self.lines[row - 1].chars().count();
             self.lines[row - 1].push_str(&cur);
-            self.cursor_row -= 1; self.cursor_col = prev_len; self.dirty = true;
+            self.cursor_row -= 1; self.cursor_col = prev_char_len; self.dirty = true;
         }
     }
     fn delete_char(&mut self) {
         let (row, col) = (self.cursor_row, self.cursor_col);
-        if col < self.lines[row].len() {
-            self.lines[row].remove(col); self.dirty = true;
+        let char_count = self.lines[row].chars().count();
+        if col < char_count {
+            let byte_idx = Self::char_to_byte(&self.lines[row], col);
+            self.lines[row].remove(byte_idx); self.dirty = true;
         } else if row + 1 < self.lines.len() {
             let next = self.lines.remove(row + 1);
             self.lines[row].push_str(&next); self.dirty = true;
@@ -214,11 +230,11 @@ impl Buffer {
     fn move_cursor(&mut self, dr: i32, dc: i32) {
         self.cursor_row = (self.cursor_row as i32 + dr)
             .clamp(0, self.lines.len() as i32 - 1) as usize;
-        let ll = self.lines[self.cursor_row].len();
+        let char_len = self.lines[self.cursor_row].chars().count() as i32;
         if dc != 0 {
-            self.cursor_col = (self.cursor_col as i32 + dc).clamp(0, ll as i32) as usize;
+            self.cursor_col = (self.cursor_col as i32 + dc).clamp(0, char_len) as usize;
         } else {
-            self.cursor_col = self.cursor_col.min(ll);
+            self.cursor_col = self.cursor_col.min(char_len as usize);
         }
     }
     fn file_ext(&self) -> String {
