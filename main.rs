@@ -361,9 +361,8 @@ const VERSION: &str = "  v0.2.0";
 
 struct Dashboard {
     git: Option<GitStatus>,
-    recent: Vec<PathBuf>,    // recent dirs / files from cwd listing
-    selected: usize,
-    action_sel: usize,       // 0=new 1=open 2=quit
+    recent: Vec<PathBuf>,
+    selected: usize,         // index into recent file list
 }
 
 impl Dashboard {
@@ -380,7 +379,7 @@ impl Dashboard {
             files.sort();
             recent = files.into_iter().take(12).collect();
         }
-        Dashboard { git, recent, selected: 0, action_sel: 0 }
+        Dashboard { git, recent, selected: 0 }
     }
 
     fn render(&self, out: &mut impl Write, tw: u16, th: u16) -> io::Result<()> {
@@ -388,138 +387,194 @@ impl Dashboard {
         let w = tw as usize;
         let h = th as usize;
 
-        // ── logo block ────────────────────────────────────────────────────
-        let logo_w = LOGO[0].chars().count();
-        let lx = (w.saturating_sub(logo_w)) / 2;
+        // ── layout: split screen left=logo+git  right=file list ──────────
+        let content_w = w.min(120);
+        let cx = (w.saturating_sub(content_w)) / 2;
+        let left_w  = content_w / 2;
+        let right_w = content_w - left_w;
+
+        // ── LEFT: logo ────────────────────────────────────────────────────
         let logo_lines = LOGO.len();
-        let total_h = logo_lines + 2 + 1 + 2 + self.recent.len().min(12) + 6;
-        let ly = (h.saturating_sub(total_h)) / 2;
+        let logo_w = LOGO[0].chars().count();
+        let logo_x = cx + (left_w.saturating_sub(logo_w)) / 2;
+        let logo_y = 2usize;
 
         for (i, ln) in LOGO.iter().enumerate() {
-            // gradient: top rows more dim, bottom more bright
-            let r_val = (60 + i * 30).min(160) as u8;
-            let g_val = (80 + i * 20).min(180) as u8;
-            let b_val = (200u8).saturating_sub((i * 10) as u8);
-            queue!(out, cursor::MoveTo(lx as u16, (ly + i) as u16),
-                style::SetForegroundColor(Color::Rgb { r: r_val, g: g_val, b: b_val }),
+            let t = i as f32 / logo_lines as f32;
+            let r = (60.0 + t * 100.0) as u8;
+            let g = (100.0 + t * 80.0) as u8;
+            let b = (220.0 - t * 60.0) as u8;
+            queue!(out, cursor::MoveTo(logo_x as u16, (logo_y + i) as u16),
+                style::SetForegroundColor(Color::Rgb { r, g, b }),
                 style::Print(ln),
                 style::SetForegroundColor(Color::Reset),
             )?;
         }
 
-        // tagline + version
-        let tl_x = (w.saturating_sub(TAGLINE.trim().chars().count())) / 2;
-        queue!(out, cursor::MoveTo(tl_x as u16, (ly + logo_lines + 1) as u16),
-            style::SetForegroundColor(Color::Rgb { r: 120, g: 140, b: 190 }),
+        // tagline + version below logo
+        let tag_y = logo_y + logo_lines + 1;
+        let tl_x = cx + (left_w.saturating_sub(TAGLINE.trim().chars().count())) / 2;
+        queue!(out, cursor::MoveTo(tl_x as u16, tag_y as u16),
+            style::SetForegroundColor(Color::Rgb { r: 110, g: 130, b: 185 }),
             style::Print(TAGLINE.trim()),
+            style::SetForegroundColor(Color::Reset),
         )?;
-        let v_x = (w.saturating_sub(VERSION.trim().chars().count())) / 2;
-        queue!(out, cursor::MoveTo(v_x as u16, (ly + logo_lines + 2) as u16),
-            style::SetForegroundColor(Color::Rgb { r: 70, g: 85, b: 130 }),
+        let ver_x = cx + (left_w.saturating_sub(VERSION.trim().chars().count())) / 2;
+        queue!(out, cursor::MoveTo(ver_x as u16, (tag_y + 1) as u16),
+            style::SetForegroundColor(Color::Rgb { r: 60, g: 75, b: 120 }),
             style::Print(VERSION.trim()),
             style::SetForegroundColor(Color::Reset),
         )?;
 
-        // ── git status box ────────────────────────────────────────────────
-        let git_y = ly + logo_lines + 4;
+        // ── LEFT: git status ──────────────────────────────────────────────
+        let git_y = tag_y + 3;
         if let Some(ref g) = self.git {
-            let box_w = 44usize;
-            let bx = (w.saturating_sub(box_w)) / 2;
+            let box_w = left_w.min(44);
+            let bx = cx + (left_w.saturating_sub(box_w)) / 2;
             self.draw_box(out, bx as u16, git_y as u16, box_w, 5)?;
-            // title
+            // "git" title on top border
             queue!(out, cursor::MoveTo((bx + 2) as u16, git_y as u16),
                 style::SetForegroundColor(Color::Rgb { r: 240, g: 200, b: 80 }),
-                style::Print("  git "),
+                style::Print(" git "),
                 style::SetForegroundColor(Color::Reset),
             )?;
             // branch
-            let branch_str = format!("  branch  {}", g.branch);
+            let branch_icon = " ";
             queue!(out, cursor::MoveTo((bx + 2) as u16, (git_y + 1) as u16),
-                style::SetForegroundColor(Color::Rgb { r: 100, g: 200, b: 120 }),
-                style::Print(&branch_str),
+                style::SetForegroundColor(Color::Rgb { r: 90, g: 195, b: 110 }),
+                style::Print(format!(" {}  {}", branch_icon, g.branch)),
                 style::SetForegroundColor(Color::Reset),
             )?;
-            // stats row
-            let stats = format!(
-                "  ~{}  +{}  ?{}{}{}",
-                g.modified, g.staged, g.untracked,
-                if g.ahead  > 0 { format!("  ↑{}", g.ahead)  } else { String::new() },
-                if g.behind > 0 { format!("  ↓{}", g.behind) } else { String::new() },
-            );
-            queue!(out, cursor::MoveTo((bx + 2) as u16, (git_y + 2) as u16),
-                style::SetForegroundColor(Color::Rgb { r: 180, g: 180, b: 180 }),
-                style::Print(&stats),
-                style::SetForegroundColor(Color::Reset),
-            )?;
-            // legend row
-            let legend = "  ~ modified  + staged  ? untracked";
-            queue!(out, cursor::MoveTo((bx + 2) as u16, (git_y + 3) as u16),
-                style::SetForegroundColor(Color::Rgb { r: 70, g: 80, b: 110 }),
-                style::Print(legend),
+            // stats
+            let mut stats_parts = Vec::new();
+            if g.modified > 0  { stats_parts.push(format!("~{} modified",  g.modified)); }
+            if g.staged > 0    { stats_parts.push(format!("+{} staged",    g.staged));   }
+            if g.untracked > 0 { stats_parts.push(format!("?{} untracked", g.untracked));}
+            if g.ahead > 0     { stats_parts.push(format!("↑{} ahead",     g.ahead));    }
+            if g.behind > 0    { stats_parts.push(format!("↓{} behind",    g.behind));   }
+            if stats_parts.is_empty() { stats_parts.push("clean".into()); }
+            for (si, part) in stats_parts.iter().enumerate().take(3) {
+                let col = if part.starts_with('~') { Color::Rgb { r: 220, g: 160, b: 60 } }
+                     else if part.starts_with('+') { Color::Rgb { r: 90,  g: 200, b: 90  } }
+                     else if part.starts_with('?') { Color::Rgb { r: 180, g: 130, b: 60  } }
+                     else if part.starts_with('↑') { Color::Rgb { r: 100, g: 170, b: 240 } }
+                     else if part.starts_with('↓') { Color::Rgb { r: 200, g: 100, b: 100 } }
+                     else                          { Color::Rgb { r: 80,  g: 180, b: 100 } };
+                queue!(out, cursor::MoveTo((bx + 2) as u16, (git_y + 2 + si) as u16),
+                    style::SetForegroundColor(col),
+                    style::Print(format!("  {}", part)),
+                    style::SetForegroundColor(Color::Reset),
+                )?;
+            }
+        } else {
+            // no git — show a small "no repo" hint
+            let msg = "  no git repository";
+            let mx = cx + (left_w.saturating_sub(msg.chars().count())) / 2;
+            queue!(out, cursor::MoveTo(mx as u16, git_y as u16),
+                style::SetForegroundColor(Color::Rgb { r: 50, g: 55, b: 80 }),
+                style::Print(msg),
                 style::SetForegroundColor(Color::Reset),
             )?;
         }
 
-        // ── quick-open file list ──────────────────────────────────────────
-        let list_y = git_y + if self.git.is_some() { 6 } else { 0 };
-        let list_w = 50usize;
-        let lx2 = (w.saturating_sub(list_w)) / 2;
-
-        if !self.recent.is_empty() {
-            self.draw_box(out, lx2 as u16, list_y as u16, list_w, self.recent.len() + 2)?;
-            // title
-            queue!(out, cursor::MoveTo((lx2 + 2) as u16, list_y as u16),
-                style::SetForegroundColor(Color::Rgb { r: 100, g: 200, b: 240 }),
-                style::Print("  files "),
+        // ── LEFT: shortcut keys legend ─────────────────────────────────────
+        let keys_y = git_y + 7;
+        let shortcuts = [
+            (" n ", " New file"),
+            (" e ", " Open explorer"),
+            (" ? ", " Help"),
+            (" q ", " Quit"),
+        ];
+        for (ki, (key, desc)) in shortcuts.iter().enumerate() {
+            let ky = keys_y + ki;
+            if ky >= h.saturating_sub(2) { break; }
+            let kx = cx + (left_w.saturating_sub(key.len() + desc.len())) / 2;
+            queue!(out, cursor::MoveTo(kx as u16, ky as u16),
+                style::SetBackgroundColor(Color::Rgb { r: 25, g: 30, b: 55 }),
+                style::SetForegroundColor(Color::Rgb { r: 150, g: 180, b: 240 }),
+                style::Print(key),
+                style::SetBackgroundColor(Color::Reset),
+                style::SetForegroundColor(Color::Rgb { r: 110, g: 120, b: 160 }),
+                style::Print(desc),
                 style::SetForegroundColor(Color::Reset),
             )?;
-            for (i, p) in self.recent.iter().enumerate() {
+        }
+
+        // ── vertical divider ──────────────────────────────────────────────
+        let div_x = (cx + left_w) as u16;
+        for row in 1..h.saturating_sub(1) {
+            queue!(out, cursor::MoveTo(div_x, row as u16),
+                style::SetForegroundColor(Color::Rgb { r: 28, g: 34, b: 58 }),
+                style::Print("│"),
+                style::SetForegroundColor(Color::Reset),
+            )?;
+        }
+
+        // ── RIGHT: file list ──────────────────────────────────────────────
+        let rx = cx + left_w + 2;
+        let list_inner_w = right_w.saturating_sub(3);
+        let list_h = h.saturating_sub(4);
+
+        // header
+        let cwd_str = env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into());
+        let cwd_short = if cwd_str.chars().count() > list_inner_w.saturating_sub(3) {
+            let skip = cwd_str.chars().count().saturating_sub(list_inner_w - 3);
+            format!("…{}", cwd_str.chars().skip(skip).collect::<String>())
+        } else { cwd_str.clone() };
+        queue!(out, cursor::MoveTo(rx as u16, 1),
+            style::SetForegroundColor(Color::Rgb { r: 80, g: 185, b: 210 }),
+            style::Print(format!(" {}", cwd_short)),
+            style::SetForegroundColor(Color::Reset),
+        )?;
+        // separator
+        queue!(out, cursor::MoveTo(rx as u16, 2),
+            style::SetForegroundColor(Color::Rgb { r: 28, g: 34, b: 58 }),
+            style::Print("─".repeat(list_inner_w)),
+            style::SetForegroundColor(Color::Reset),
+        )?;
+
+        if self.recent.is_empty() {
+            queue!(out, cursor::MoveTo(rx as u16, 3),
+                style::SetForegroundColor(Color::Rgb { r: 50, g: 55, b: 80 }),
+                style::Print(" (no files in directory)"),
+                style::SetForegroundColor(Color::Reset),
+            )?;
+        } else {
+            // scroll so selected is visible
+            let scroll = if self.selected >= list_h {
+                self.selected - list_h + 1
+            } else { 0 };
+            for (vi, i) in (scroll..).take(list_h).enumerate() {
+                if i >= self.recent.len() { break; }
+                let p = &self.recent[i];
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let ext  = p.extension().and_then(|e| e.to_str()).unwrap_or("");
                 let icon = ext_icon(ext);
-                let sel = i == self.selected;
+                let sel  = i == self.selected;
                 let label = format!(" {} {}", icon, name);
-                let label = pad_str(&label, list_w - 4);
+                let label = pad_str(&label, list_inner_w);
                 let (bg, fg) = if sel {
-                    (Color::Rgb { r: 35, g: 70, b: 140 }, Color::White)
+                    (Color::Rgb { r: 32, g: 65, b: 145 }, Color::Rgb { r: 230, g: 235, b: 255 })
                 } else {
-                    (Color::Rgb { r: 12, g: 14, b: 22 }, Color::Rgb { r: 170, g: 175, b: 200 })
+                    (Color::Rgb { r: 10, g: 12, b: 20 }, Color::Rgb { r: 155, g: 165, b: 195 })
                 };
-                queue!(out, cursor::MoveTo((lx2 + 2) as u16, (list_y + 1 + i) as u16),
+                queue!(out, cursor::MoveTo(rx as u16, (3 + vi) as u16),
                     style::SetBackgroundColor(bg), style::SetForegroundColor(fg),
-                    style::Print(label),
+                    style::Print(&label),
                     style::SetBackgroundColor(Color::Reset), style::SetForegroundColor(Color::Reset),
                 )?;
             }
         }
 
-        // ── action buttons ────────────────────────────────────────────────
-        let btn_y = list_y + self.recent.len() + 3;
-        let actions = [" + New File ", " > Open... ", " x  Quit   "];
-        let total_btn_w: usize = actions.iter().map(|a| a.chars().count() + 2).sum::<usize>() + actions.len() - 1;
-        let mut bx2 = (w.saturating_sub(total_btn_w)) / 2;
-        for (i, label) in actions.iter().enumerate() {
-            let sel = i == self.action_sel;
-            let (bg, fg) = if sel {
-                (Color::Rgb { r: 45, g: 90, b: 180 }, Color::White)
-            } else {
-                (Color::Rgb { r: 25, g: 28, b: 45 }, Color::Rgb { r: 120, g: 135, b: 180 })
-            };
-            queue!(out, cursor::MoveTo(bx2 as u16, btn_y as u16),
-                style::SetBackgroundColor(bg), style::SetForegroundColor(fg),
-                style::Print(label),
-                style::SetBackgroundColor(Color::Reset), style::SetForegroundColor(Color::Reset),
-            )?;
-            bx2 += label.chars().count() + 2;
-        }
-
-        // ── footer hint ───────────────────────────────────────────────────
-        let hint = "↑↓ files   ←→ actions   Enter select   n new   q quit";
-        let hx = (w.saturating_sub(hint.chars().count())) / 2;
-        queue!(out, cursor::MoveTo(hx as u16, th - 1),
-            style::SetForegroundColor(Color::Rgb { r: 55, g: 65, b: 100 }),
-            style::Print(hint),
-            style::SetForegroundColor(Color::Reset),
+        // ── footer ────────────────────────────────────────────────────────
+        let hint = " ↑↓ navigate   Enter open   n new file   e explorer   q quit";
+        queue!(out, cursor::MoveTo(0, th - 1),
+            style::SetBackgroundColor(Color::Rgb { r: 10, g: 12, b: 24 }),
+            style::SetForegroundColor(Color::Rgb { r: 48, g: 58, b: 95 }),
+            style::Print(pad_str(hint, w)),
+            style::SetBackgroundColor(Color::Reset), style::SetForegroundColor(Color::Reset),
         )?;
 
         out.flush()
@@ -870,7 +925,9 @@ const TERM_H: u16 = 12;
 struct App {
     mode: Mode,
     prev_mode: Mode,
-    buffer: Buffer,
+    // ── tabs ──
+    tabs: Vec<Buffer>,
+    tab_idx: usize,
     explorer: Explorer,
     status: String,
     cmd_buf: String,
@@ -888,13 +945,14 @@ impl App {
     fn new(path: Option<PathBuf>) -> io::Result<Self> {
         let (tw, th) = terminal::size()?;
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let (buffer, start_mode) = if let Some(p) = &path {
+        let (first_buf, start_mode) = if let Some(p) = &path {
             (Buffer::from_file(p.clone()).unwrap_or_else(|_| Buffer::empty()), Mode::Normal)
         } else {
             (Buffer::empty(), Mode::Dashboard)
         };
         Ok(App {
-            mode: start_mode, prev_mode: Mode::Normal, buffer,
+            mode: start_mode, prev_mode: Mode::Normal,
+            tabs: vec![first_buf], tab_idx: 0,
             explorer: Explorer::new(cwd),
             status: "AMEK  |  i=insert  v=visual  c=terminal  e=explorer  ?=help".into(),
             cmd_buf: String::new(), tw, th,
@@ -909,8 +967,32 @@ impl App {
     // ── layout ──────────────────────────────────────────────────────────
 
     fn ex(&self)  -> u16 { if self.show_exp  { EXP_W + 1 } else { 0 } }
-    fn eh(&self)  -> u16 { self.th.saturating_sub(2 + if self.show_term { TERM_H } else { 0 }) }
+    // +1 for tab bar row
+    fn eh(&self)  -> u16 { self.th.saturating_sub(3 + if self.show_term { TERM_H } else { 0 }) }
     fn ew(&self)  -> u16 { self.tw.saturating_sub(self.ex()) }
+
+    // ── tab helpers ──────────────────────────────────────────────────────
+
+    fn buf(&self) -> &Buffer { &self.tabs[self.tab_idx] }
+    fn buf_mut(&mut self) -> &mut Buffer { &mut self.tabs[self.tab_idx] }
+
+    fn tab_new(&mut self, buf: Buffer) {
+        self.tabs.insert(self.tab_idx + 1, buf);
+        self.tab_idx += 1;
+    }
+    fn tab_close(&mut self) {
+        if self.tabs.len() == 1 { self.tabs[0] = Buffer::empty(); return; }
+        self.tabs.remove(self.tab_idx);
+        if self.tab_idx >= self.tabs.len() { self.tab_idx = self.tabs.len() - 1; }
+    }
+    fn tab_next(&mut self) {
+        if self.tabs.len() > 1 { self.tab_idx = (self.tab_idx + 1) % self.tabs.len(); }
+    }
+    fn tab_prev(&mut self) {
+        if self.tabs.len() > 1 {
+            self.tab_idx = if self.tab_idx == 0 { self.tabs.len() - 1 } else { self.tab_idx - 1 };
+        }
+    }
 
     // ── render dispatcher ────────────────────────────────────────────────
 
@@ -925,6 +1007,7 @@ impl App {
     fn render_editor_frame(&mut self, out: &mut impl Write) -> io::Result<()> {
         queue!(out, terminal::Clear(ClearType::All))?;
         self.render_title(out)?;
+        self.render_tabbar(out)?;
         if self.show_exp  { self.render_explorer(out)?; }
         self.render_editor(out)?;
         if self.show_term { self.render_term(out)?; }
@@ -934,14 +1017,78 @@ impl App {
         out.flush()
     }
 
+    // ── tab bar (row 1) ──────────────────────────────────────────────────
+
+    fn render_tabbar(&self, out: &mut impl Write) -> io::Result<()> {
+        let w = self.tw as usize;
+        // fill background
+        queue!(out, cursor::MoveTo(0, 1),
+            style::SetBackgroundColor(Color::Rgb { r: 9, g: 11, b: 22 }),
+            style::Print(" ".repeat(w)),
+            style::SetBackgroundColor(Color::Reset),
+        )?;
+        let mut x = 0u16;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let name = tab.path.as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "[untitled]".into());
+            let dirty = if tab.dirty { " ●" } else { "" };
+            let label = format!("  {}{}  ", name, dirty);
+            let lw = label.chars().count() as u16;
+            if x as usize + lw as usize >= w { break; }
+            let active = i == self.tab_idx;
+            let (bg, fg) = if active {
+                (Color::Rgb { r: 18, g: 24, b: 50 }, Color::Rgb { r: 200, g: 210, b: 240 })
+            } else {
+                (Color::Rgb { r: 9, g: 11, b: 22 }, Color::Rgb { r: 75, g: 85, b: 120 })
+            };
+            queue!(out, cursor::MoveTo(x, 1),
+                style::SetBackgroundColor(bg), style::SetForegroundColor(fg),
+                style::Print(&label),
+                style::SetBackgroundColor(Color::Reset), style::SetForegroundColor(Color::Reset),
+            )?;
+            // active tab: bottom border highlight
+            if active {
+                queue!(out, cursor::MoveTo(x, 1),
+                    style::SetBackgroundColor(bg),
+                    style::SetForegroundColor(Color::Rgb { r: 80, g: 140, b: 255 }),
+                    style::Print("▔".repeat(lw as usize)),
+                    style::SetBackgroundColor(Color::Reset), style::SetForegroundColor(Color::Reset),
+                )?;
+                // reprint label on top of border char (border is on top row of cell via ▔)
+                queue!(out, cursor::MoveTo(x, 1),
+                    style::SetBackgroundColor(bg), style::SetForegroundColor(fg),
+                    style::Print(&label),
+                    style::SetBackgroundColor(Color::Reset), style::SetForegroundColor(Color::Reset),
+                )?;
+            }
+            // separator between inactive tabs
+            if !active && i + 1 < self.tabs.len() && i + 1 != self.tab_idx {
+                queue!(out, cursor::MoveTo(x + lw, 1),
+                    style::SetForegroundColor(Color::Rgb { r: 30, g: 35, b: 55 }),
+                    style::Print("│"),
+                    style::SetForegroundColor(Color::Reset),
+                )?;
+            }
+            x += lw + if active { 0 } else { 1 };
+        }
+        // hint on right
+        let hint = " ^B new  ^M close  ^← ^→ switch ";
+        let hx = (w as u16).saturating_sub(hint.chars().count() as u16);
+        queue!(out, cursor::MoveTo(hx, 1),
+            style::SetForegroundColor(Color::Rgb { r: 40, g: 48, b: 75 }),
+            style::Print(hint),
+            style::SetForegroundColor(Color::Reset),
+        )?;
+        Ok(())
+    }
+
     // ── title bar ────────────────────────────────────────────────────────
 
     fn render_title(&self, out: &mut impl Write) -> io::Result<()> {
-        let fname = self.buffer.path.as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "[untitled]".into());
-        let dirty = if self.buffer.dirty { " ●" } else { "" };
-        let left = format!("  AMEK  │  {}{}", fname, dirty);
+        let tab_count = format!("  {} tab{}", self.tabs.len(), if self.tabs.len() == 1 { "" } else { "s" });
+        let left = format!("  AMEK  │{}", tab_count);
         let (badge, badge_bg) = match self.mode {
             Mode::Normal   => ("  NORMAL  ", Color::Rgb { r: 40, g: 70, b: 140 }),
             Mode::Insert   => ("  INSERT  ", Color::Rgb { r: 30, g: 150, b: 70  }),
@@ -951,7 +1098,7 @@ impl App {
             Mode::Terminal => (" TERMINAL ", Color::Rgb { r: 20, g: 120, b: 100 }),
             _              => ("  NORMAL  ", Color::Rgb { r: 40, g: 70, b: 140 }),
         };
-        let right = format!("{} Ln {}  Col {} ", badge, self.buffer.row+1, self.buffer.col+1);
+        let right = format!("{} Ln {}  Col {} ", badge, self.buf().row+1, self.buf().col+1);
         let fill  = (self.tw as usize).saturating_sub(left.chars().count() + right.chars().count());
         let bar: String = format!("{}{}{}", left, " ".repeat(fill), right)
             .chars().take(self.tw as usize).collect();
@@ -976,7 +1123,7 @@ impl App {
         let h = self.eh();
         let w = EXP_W as usize;
         for row in 0..h {
-            queue!(out, cursor::MoveTo(0, row+1),
+            queue!(out, cursor::MoveTo(0, row+2),
                 style::SetBackgroundColor(Color::Rgb { r: 14, g: 16, b: 24 }),
                 style::Print(" ".repeat(w)),
                 style::SetBackgroundColor(Color::Reset),
@@ -988,7 +1135,7 @@ impl App {
             dir_s.chars().skip(skip).collect::<String>()
         } else { dir_s.clone() };
         let header = pad_str(&format!(" ▸ {}", trimmed), w);
-        queue!(out, cursor::MoveTo(0,1),
+        queue!(out, cursor::MoveTo(0,2),
             style::SetBackgroundColor(Color::Rgb { r: 20, g: 24, b: 40 }),
             style::SetForegroundColor(Color::Rgb { r: 80, g: 185, b: 205 }),
             style::Print(header),
@@ -1000,7 +1147,7 @@ impl App {
             self.explorer.scroll = self.explorer.selected.saturating_sub(vis - 1);
         }
         for (i, entry) in self.explorer.entries.iter().enumerate().skip(self.explorer.scroll).take(vis) {
-            let row = (i - self.explorer.scroll + 2) as u16 + 1;
+            let row = (i - self.explorer.scroll + 2) as u16 + 2;
             let is_dir = entry.is_dir();
             let name = entry.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let pfx = if is_dir { "▸ " } else {
@@ -1029,7 +1176,7 @@ impl App {
         }
         // separator
         for row in 0..h {
-            queue!(out, cursor::MoveTo(EXP_W, row+1),
+            queue!(out, cursor::MoveTo(EXP_W, row+2),
                 style::SetForegroundColor(Color::Rgb { r: 32, g: 40, b: 70 }),
                 style::Print("│"),
                 style::SetForegroundColor(Color::Reset),
@@ -1046,24 +1193,24 @@ impl App {
         let eh = self.eh() as usize;
         let gutter = 5usize;
         let col_area = ew.saturating_sub(gutter);
-        let ext = self.buffer.ext();
+        let ext = self.buf().ext();
 
         // scroll adjust
-        if self.buffer.row < self.buffer.srow { self.buffer.srow = self.buffer.row; }
-        else if self.buffer.row >= self.buffer.srow + eh { self.buffer.srow = self.buffer.row - eh + 1; }
-        if self.buffer.col < self.buffer.scol { self.buffer.scol = self.buffer.col; }
-        else if self.buffer.col >= self.buffer.scol + col_area { self.buffer.scol = self.buffer.col - col_area + 1; }
+        if self.buf().row < self.buf().srow { self.buf_mut().srow = self.buf().row; }
+        else if self.buf().row >= self.buf().srow + eh { self.buf_mut().srow = self.buf().row - eh + 1; }
+        if self.buf().col < self.buf().scol { self.buf_mut().scol = self.buf().col; }
+        else if self.buf().col >= self.buf().scol + col_area { self.buf_mut().scol = self.buf().col - col_area + 1; }
 
         let (sel_sr, sel_sc, sel_er, sel_ec) = if let (Some(sel), true) = (&self.sel, self.mode == Mode::Visual) {
-            let (a,b,c,d) = order_sel(sel.anchor_row, sel.anchor_col, self.buffer.row, self.buffer.col);
+            let (a,b,c,d) = order_sel(sel.anchor_row, sel.anchor_col, self.buf().row, self.buf().col);
             (a, b, c, d+1)
         } else { (0,0,0,0) };
         let has_sel = self.mode == Mode::Visual && self.sel.is_some();
 
         for sr in 0..eh {
-            let br = sr + self.buffer.srow;
-            queue!(out, cursor::MoveTo(ex, sr as u16 + 1))?;
-            if br >= self.buffer.lines.len() {
+            let br = sr + self.buf().srow;
+            queue!(out, cursor::MoveTo(ex, sr as u16 + 2))?;
+            if br >= self.buf().lines.len() {
                 queue!(out,
                     style::SetForegroundColor(Color::Rgb { r: 34, g: 38, b: 56 }),
                     style::Print(format!("{:>4} ", "~")),
@@ -1071,7 +1218,7 @@ impl App {
                     style::Print(" ".repeat(col_area)),
                 )?; continue;
             }
-            let is_cur = br == self.buffer.row;
+            let is_cur = br == self.buf().row;
             let cur_bg = Color::Rgb { r: 17, g: 21, b: 36 };
             if is_cur { queue!(out, style::SetBackgroundColor(cur_bg))?; }
             // gutter
@@ -1083,9 +1230,9 @@ impl App {
                 style::SetForegroundColor(Color::Reset),
             )?;
             // syntax tokens
-            let line = &self.buffer.lines[br];
+            let line = &self.buf().lines[br];
             let toks = highlight(line, &ext);
-            let sc = self.buffer.scol;
+            let sc = self.buf().scol;
             let mut cp = 0usize;
             for tok in &toks {
                 let ts = cp; let te = cp + tok.text.chars().count(); cp = te;
@@ -1125,7 +1272,7 @@ impl App {
     // ── terminal pane ────────────────────────────────────────────────────
 
     fn render_term(&mut self, out: &mut impl Write) -> io::Result<()> {
-        let top = self.th.saturating_sub(TERM_H + 1);
+        let top = self.th.saturating_sub(TERM_H + 1); // status bar is 1 row
         let w = self.tw as usize;
         // header bar
         let hdr = pad_str(" ❯ TERMINAL  (Esc = close)", w);
@@ -1162,11 +1309,11 @@ impl App {
         let y = self.th - 1;
         let left = if self.mode == Mode::Visual {
             if let Some(sel) = &self.sel {
-                let txt = self.buffer.selected_text(sel);
+                let txt = self.buf().selected_text(sel);
                 format!("  VISUAL  {}ch  {}ln  ", txt.chars().count(), txt.lines().count().max(1))
             } else { format!("  {}  ", self.status) }
         } else { format!("  {}  ", self.status) };
-        let ext = self.buffer.ext().to_uppercase();
+        let ext = self.buf().ext().to_uppercase();
         let right = format!("  {}  ", if ext.is_empty() { "TXT" } else { &ext });
         let fill = (self.tw as usize).saturating_sub(left.chars().count() + right.chars().count());
         let bar: String = format!("{}{}{}", left, " ".repeat(fill), right)
@@ -1304,7 +1451,7 @@ impl App {
     fn place_cursor(&self, out: &mut impl Write) -> io::Result<()> {
         match self.mode {
             Mode::Explorer => {
-                let r = (self.explorer.selected.saturating_sub(self.explorer.scroll) + 2) as u16 + 1;
+                let r = (self.explorer.selected.saturating_sub(self.explorer.scroll) + 2) as u16 + 2;
                 queue!(out, cursor::MoveTo(1, r))
             }
             Mode::Command => {
@@ -1316,8 +1463,9 @@ impl App {
             }
             _ => {
                 let ex = self.ex();
-                let x = ex + 5 + self.buffer.col.saturating_sub(self.buffer.scol) as u16;
-                let y = 1 + self.buffer.row.saturating_sub(self.buffer.srow) as u16;
+                let x = ex + 5 + self.buf().col.saturating_sub(self.buf().scol) as u16;
+                // +2: row 0 = title bar, row 1 = tab bar
+                let y = 2 + self.buf().row.saturating_sub(self.buf().srow) as u16;
                 queue!(out, cursor::MoveTo(x, y))
             }
         }
@@ -1343,39 +1491,61 @@ impl App {
 
     fn on_dashboard(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
+            // quit
             (KeyCode::Char('q'), _) | (KeyCode::Char('q'), KeyModifiers::CONTROL) => return true,
+
+            // new empty file → normal mode
             (KeyCode::Char('n'), _) => {
-                self.buffer = Buffer::empty(); self.mode = Mode::Normal;
-                self.status = "New buffer.".into();
+                self.tab_new(Buffer::empty());
+                self.mode = Mode::Normal;
+                self.status = "New file.".into();
             }
-            (KeyCode::Up, _) => {
+
+            // open explorer
+            (KeyCode::Char('e'), _) => {
+                self.tab_new(Buffer::empty());
+                self.mode = Mode::Explorer;
+                self.show_exp = true;
+                self.status = "EXPLORER  |  Esc=back".into();
+            }
+
+            // help
+            (KeyCode::Char('?'), _) => {
+                self.prev_mode = Mode::Dashboard;
+                self.mode = Mode::Help;
+            }
+
+            // navigate file list
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
                 if self.dash.selected > 0 { self.dash.selected -= 1; }
             }
-            (KeyCode::Down, _) => {
-                if self.dash.selected + 1 < self.dash.recent.len() { self.dash.selected += 1; }
-            }
-            (KeyCode::Left, _) => {
-                if self.dash.action_sel > 0 { self.dash.action_sel -= 1; }
-            }
-            (KeyCode::Right, _) => {
-                if self.dash.action_sel < 2 { self.dash.action_sel += 1; }
-            }
-            (KeyCode::Enter, _) => {
-                match self.dash.action_sel {
-                    0 => { self.buffer = Buffer::empty(); self.mode = Mode::Normal; self.status = "New buffer.".into(); }
-                    1 => {
-                        // open selected file in list
-                        if let Some(path) = self.dash.recent.get(self.dash.selected).cloned() {
-                            self.status = match Buffer::from_file(path.clone()) {
-                                Ok(buf) => { self.buffer = buf; self.mode = Mode::Normal; format!("Opened: {}", path.display()) }
-                                Err(e) => format!("Error: {}", e),
-                            };
-                        }
-                    }
-                    _ => return true,
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                if self.dash.selected + 1 < self.dash.recent.len() {
+                    self.dash.selected += 1;
                 }
             }
-            (KeyCode::Char('?'), _) => { self.prev_mode = Mode::Dashboard; self.mode = Mode::Help; }
+
+            // open highlighted file (Enter or o)
+            (KeyCode::Enter, _) | (KeyCode::Char('o'), _) => {
+                if let Some(path) = self.dash.recent.get(self.dash.selected).cloned() {
+                    match Buffer::from_file(path.clone()) {
+                        Ok(buf) => {
+                            self.tab_new(buf);
+                            self.mode = Mode::Normal;
+                            self.status = format!("Opened: {}", path.display());
+                        }
+                        Err(e) => {
+                            self.status = format!("Error opening file: {}", e);
+                        }
+                    }
+                } else {
+                    // no file selected → open a new empty buffer
+                    self.tab_new(Buffer::empty());
+                    self.mode = Mode::Normal;
+                    self.status = "New file.".into();
+                }
+            }
+
             _ => {}
         }
         false
@@ -1385,11 +1555,23 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => return true,
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                self.status = match self.buffer.save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) };
+                self.status = match self.buf_mut().save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) };
             }
+            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                self.tab_new(Buffer::empty());
+                self.mode = Mode::Normal;
+                self.status = "New tab.".into();
+            }
+            (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
+                self.tab_close();
+                self.mode = Mode::Normal;
+                self.status = "Tab closed.".into();
+            }
+            (KeyCode::Left, KeyModifiers::CONTROL) => { self.tab_prev(); }
+            (KeyCode::Right, KeyModifiers::CONTROL) => { self.tab_next(); }
             (KeyCode::Char('i'), _) => { self.mode = Mode::Insert; self.status = "-- INSERT --".into(); }
             (KeyCode::Char('v'), _) => {
-                self.sel = Some(Sel { anchor_row: self.buffer.row, anchor_col: self.buffer.col });
+                self.sel = Some(Sel { anchor_row: self.buf().row, anchor_col: self.buf().col });
                 self.mode = Mode::Visual;
                 self.status = "-- VISUAL --  d=delete  y=yank  Esc=cancel".into();
             }
@@ -1397,14 +1579,14 @@ impl App {
             (KeyCode::Char('e'), _) | (KeyCode::Tab, _) => { self.show_exp = true; self.mode = Mode::Explorer; self.status = "EXPLORER  |  Esc=back".into(); }
             (KeyCode::Char(':'), _) => { self.mode = Mode::Command; self.cmd_buf.clear(); }
             (KeyCode::Char('?'), _) => { self.prev_mode = Mode::Normal; self.mode = Mode::Help; }
-            (KeyCode::Up, _)        => self.buffer.move_cursor(-1, 0),
-            (KeyCode::Down, _)      => self.buffer.move_cursor(1, 0),
-            (KeyCode::Left, _)      => self.buffer.move_cursor(0, -1),
-            (KeyCode::Right, _)     => self.buffer.move_cursor(0, 1),
-            (KeyCode::Home, _)      => self.buffer.col = 0,
-            (KeyCode::End, _)       => { let cc = self.buffer.char_count(); self.buffer.col = cc; }
-            (KeyCode::PageUp, _)    => self.buffer.move_cursor(-(self.eh() as i32), 0),
-            (KeyCode::PageDown, _)  => self.buffer.move_cursor(self.eh() as i32, 0),
+            (KeyCode::Up, _)        => self.buf_mut().move_cursor(-1, 0),
+            (KeyCode::Down, _)      => self.buf_mut().move_cursor(1, 0),
+            (KeyCode::Left, _)      => self.buf_mut().move_cursor(0, -1),
+            (KeyCode::Right, _)     => self.buf_mut().move_cursor(0, 1),
+            (KeyCode::Home, _)      => self.buf_mut().col = 0,
+            (KeyCode::End, _)       => { let cc = self.buf().char_count(); self.buf_mut().col = cc; }
+            (KeyCode::PageUp, _)    => { let h = self.eh() as i32; self.buf_mut().move_cursor(-h, 0); }
+            (KeyCode::PageDown, _)  => { let h = self.eh() as i32; self.buf_mut().move_cursor(h, 0); }
             _ => {}
         }
         false
@@ -1414,20 +1596,35 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => { self.mode = Mode::Normal; self.status = "NORMAL".into(); }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                self.status = match self.buffer.save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) };
+                self.status = match self.buf_mut().save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) };
             }
+            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                self.tab_new(Buffer::empty());
+                self.mode = Mode::Normal;
+                self.status = "New tab.".into();
+            }
+            (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
+                self.tab_close();
+                self.mode = Mode::Normal;
+                self.status = "Tab closed.".into();
+            }
+            (KeyCode::Left, KeyModifiers::CONTROL) => { self.tab_prev(); }
+            (KeyCode::Right, KeyModifiers::CONTROL) => { self.tab_next(); }
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => return true,
-            (KeyCode::Enter, _)     => self.buffer.insert_newline(),
-            (KeyCode::Backspace, _) => self.buffer.backspace(),
-            (KeyCode::Delete, _)    => self.buffer.delete_char(),
-            (KeyCode::Up, _)        => self.buffer.move_cursor(-1, 0),
-            (KeyCode::Down, _)      => self.buffer.move_cursor(1, 0),
-            (KeyCode::Left, _)      => self.buffer.move_cursor(0, -1),
-            (KeyCode::Right, _)     => self.buffer.move_cursor(0, 1),
-            (KeyCode::Home, _)      => self.buffer.col = 0,
-            (KeyCode::End, _)       => { let cc = self.buffer.char_count(); self.buffer.col = cc; }
-            (KeyCode::Tab, _)       => { for _ in 0..4 { self.buffer.insert_char(' '); } }
-            (KeyCode::Char(c), _)   => self.buffer.insert_char(c),
+            (KeyCode::Enter, _)     => self.buf_mut().insert_newline(),
+            // KeyCode::Backspace covers most terminals;
+            // Char('\x7f') is the DEL byte some terminals send for Backspace
+            (KeyCode::Backspace, _) | (KeyCode::Char('\x7f'), _) => self.buf_mut().backspace(),
+            (KeyCode::Delete, _)    => self.buf_mut().delete_char(),
+            (KeyCode::Up, _)        => self.buf_mut().move_cursor(-1, 0),
+            (KeyCode::Down, _)      => self.buf_mut().move_cursor(1, 0),
+            (KeyCode::Left, _)      => self.buf_mut().move_cursor(0, -1),
+            (KeyCode::Right, _)     => self.buf_mut().move_cursor(0, 1),
+            (KeyCode::Home, _)      => self.buf_mut().col = 0,
+            (KeyCode::End, _)       => { let cc = self.buf().char_count(); self.buf_mut().col = cc; }
+            (KeyCode::Tab, _)       => { for _ in 0..4 { self.buf_mut().insert_char(' '); } }
+            // guard: never insert control/DEL bytes as literal characters
+            (KeyCode::Char(c), _) if !c.is_control() => self.buf_mut().insert_char(c),
             _ => {}
         }
         false
@@ -1437,29 +1634,29 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => { self.mode = Mode::Normal; self.sel = None; self.status = "NORMAL".into(); }
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => return true,
-            (KeyCode::Up, _)    => self.buffer.move_cursor(-1, 0),
-            (KeyCode::Down, _)  => self.buffer.move_cursor(1, 0),
-            (KeyCode::Left, _)  => self.buffer.move_cursor(0, -1),
-            (KeyCode::Right, _) => self.buffer.move_cursor(0, 1),
-            (KeyCode::Home, _)  => self.buffer.col = 0,
-            (KeyCode::End, _)   => { let cc = self.buffer.char_count(); self.buffer.col = cc; }
+            (KeyCode::Up, _)    => self.buf_mut().move_cursor(-1, 0),
+            (KeyCode::Down, _)  => self.buf_mut().move_cursor(1, 0),
+            (KeyCode::Left, _)  => self.buf_mut().move_cursor(0, -1),
+            (KeyCode::Right, _) => self.buf_mut().move_cursor(0, 1),
+            (KeyCode::Home, _)  => self.buf_mut().col = 0,
+            (KeyCode::End, _)   => { let cc = self.buf().char_count(); self.buf_mut().col = cc; }
             (KeyCode::Char('d'), _) => {
                 if let Some(sel) = self.sel.take() {
-                    self.clipboard = self.buffer.delete_selection(&sel);
+                    self.clipboard = self.buf_mut().delete_selection(&sel);
                     self.mode = Mode::Normal;
                     self.status = format!("Deleted {} chars.", self.clipboard.chars().count());
                 }
             }
             (KeyCode::Char('y'), _) => {
                 if let Some(ref sel) = self.sel {
-                    self.clipboard = self.buffer.selected_text(sel);
+                    self.clipboard = self.buf().selected_text(sel);
                     let n = self.clipboard.chars().count();
                     self.mode = Mode::Normal; self.sel = None;
                     self.status = format!("Yanked {} chars.", n);
                 }
             }
             (KeyCode::Char('i'), _) => {
-                if let Some(sel) = self.sel.take() { self.buffer.delete_selection(&sel); }
+                if let Some(sel) = self.sel.take() { self.buf_mut().delete_selection(&sel); }
                 self.mode = Mode::Insert; self.status = "-- INSERT --".into();
             }
             _ => {}
@@ -1468,21 +1665,22 @@ impl App {
     }
 
     fn on_explorer(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Esc => { self.mode = Mode::Normal; self.status = "NORMAL".into(); }
-            KeyCode::Up   => { if self.explorer.selected > 0 { self.explorer.selected -= 1; } }
-            KeyCode::Down => { if self.explorer.selected + 1 < self.explorer.entries.len() { self.explorer.selected += 1; } }
-            KeyCode::Enter => {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => { self.mode = Mode::Normal; self.status = "NORMAL".into(); }
+            (KeyCode::Up, _)   => { if self.explorer.selected > 0 { self.explorer.selected -= 1; } }
+            (KeyCode::Down, _) => { if self.explorer.selected + 1 < self.explorer.entries.len() { self.explorer.selected += 1; } }
+            (KeyCode::Enter, _) => {
                 if let Some(path) = self.explorer.enter() {
                     self.status = match Buffer::from_file(path.clone()) {
-                        Ok(buf) => { self.buffer = buf; format!("Opened: {}", path.display()) }
+                        Ok(buf) => { self.tab_new(buf); format!("Opened: {}", path.display()) }
                         Err(e)  => format!("Error: {}", e),
                     };
                     self.mode = Mode::Normal;
                 }
             }
-            KeyCode::Backspace => self.explorer.go_up(),
-            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            // Both KeyCode::Backspace and the DEL byte (\x7f) mean "go up"
+            (KeyCode::Backspace, _) | (KeyCode::Char('\x7f'), _) => self.explorer.go_up(),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) => return true,
             _ => {}
         }
         false
@@ -1532,16 +1730,20 @@ impl App {
     fn exec_cmd(&mut self, cmd: &str) -> bool {
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
         match parts[0] {
-            "q"  => { if self.buffer.dirty { self.status = "Unsaved! Use :q! or :wq".into(); return false; } return true; }
+            "q"  => { if self.buf().dirty { self.status = "Unsaved! Use :q! or :wq".into(); return false; } return true; }
             "q!" => return true,
-            "w"  => { self.status = match self.buffer.save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) }; }
-            "wq" => { match self.buffer.save() { Ok(_) => return true, Err(e) => self.status = format!("Error: {}", e) } }
-            "new" => { self.buffer = Buffer::empty(); self.status = "New buffer.".into(); }
+            "w"  => { self.status = match self.buf_mut().save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) }; }
+            "wq" => { match self.buf_mut().save() { Ok(_) => return true, Err(e) => self.status = format!("Error: {}", e) } }
+            "new" => { self.tab_new(Buffer::empty()); self.mode = Mode::Normal; self.status = "New tab.".into(); }
+            "tabnew" | "tn" => { self.tab_new(Buffer::empty()); self.mode = Mode::Normal; self.status = "New tab.".into(); }
+            "tabclose" | "tc" => { self.tab_close(); self.status = "Tab closed.".into(); }
+            "tabnext" | "tbn" => { self.tab_next(); }
+            "tabprev" | "tbp" => { self.tab_prev(); }
             "open" => {
                 if parts.len() > 1 {
                     let path = PathBuf::from(parts[1].trim());
                     self.status = match Buffer::from_file(path.clone()) {
-                        Ok(buf) => { self.buffer = buf; format!("Opened: {}", path.display()) }
+                        Ok(buf) => { self.tab_new(buf); format!("Opened: {}", path.display()) }
                         Err(e) => format!("Error: {}", e),
                     };
                 } else { self.status = "Usage: :open <path>".into(); }
@@ -1549,7 +1751,7 @@ impl App {
             "saveas" => {
                 if parts.len() > 1 {
                     let path = PathBuf::from(parts[1].trim());
-                    self.status = match self.buffer.save_as(path.clone()) {
+                    self.status = match self.buf_mut().save_as(path.clone()) {
                         Ok(_) => format!("Saved as: {}", path.display()),
                         Err(e) => format!("Error: {}", e),
                     };
