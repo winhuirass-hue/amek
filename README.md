@@ -278,4 +278,4 @@ That's it.
 
 ## License
 
-MIT
+GPL version 3
