@@ -12,6 +12,145 @@ use std::{
     process::{Command, Stdio},
     time::Duration,
 };
+// ══════════════════════════════════════════════════════════════════════════════
+//  DIAGNOSTICS  (Python · C · C++)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, PartialEq)]
+enum Severity { Error, Warning }
+
+#[derive(Clone)]
+struct Diagnostic {
+    line: usize,   // 0-based
+    #[allow(dead_code)]
+    col:  usize,   // 0-based, best-effort (reserved for future column markers)
+    sev:  Severity,
+    msg:  String,
+}
+
+/// Write `content` to a temp file, run the right linter, return diagnostics.
+fn lint(_path: &PathBuf, content: &str, ext: &str) -> Vec<Diagnostic> {
+    // Write to a temp file so we lint the in-memory version even if unsaved.
+    let tmp_path = std::env::temp_dir().join(
+        format!("amek_lint_{}.{}", std::process::id(), ext)
+    );
+    if fs::write(&tmp_path, content).is_err() { return vec![]; }
+
+    let diags = match ext {
+        "py" => lint_python(&tmp_path),
+        "c" | "h" => lint_c(&tmp_path, false),
+        "cpp" | "cc" | "cxx" | "hpp" => lint_c(&tmp_path, true),
+        _ => vec![],
+    };
+
+    let _ = fs::remove_file(&tmp_path);
+    diags
+}
+
+fn lint_python(tmp: &PathBuf) -> Vec<Diagnostic> {
+    // py_compile prints to stderr: "  File '<path>', line N"
+    // flake8 prints: path:line:col: E/W code message
+    // We try flake8 first, fall back to py_compile.
+    let flake = Command::new("flake8")
+        .args(["--format=%(path)s:%(row)d:%(col)d:%(code)s:%(text)s", tmp.to_str().unwrap_or("")])
+        .stdout(Stdio::piped()).stderr(Stdio::null()).output();
+
+    if let Ok(out) = flake {
+        if out.status.success() || !out.stdout.is_empty() {
+            return parse_colon_format(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+
+    // fallback: python3 -m py_compile
+    let out = Command::new("python3")
+        .args(["-m", "py_compile", tmp.to_str().unwrap_or("")])
+        .stdout(Stdio::null()).stderr(Stdio::piped()).output();
+    if let Ok(o) = out {
+        let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+        return parse_python_compile(&stderr);
+    }
+    vec![]
+}
+
+fn parse_python_compile(stderr: &str) -> Vec<Diagnostic> {
+    // python3 -m py_compile stderr format:
+    //   File "path", line N -> SyntaxError: msg
+    let mut diags = Vec::new();
+    let mut line_no = None;
+    let mut msg_next = false;
+    for ln in stderr.lines() {
+        if ln.trim_start().starts_with("File ") {
+            if let Some(pos) = ln.find("line ") {
+                let rest = &ln[pos + 5..];
+                let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                line_no = num_str.parse::<usize>().ok().map(|n| n.saturating_sub(1));
+            }
+            msg_next = true;
+        } else if msg_next && !ln.trim().is_empty() && !ln.trim_start().starts_with('^') && !ln.starts_with("    ") {
+            if let Some(l) = line_no {
+                diags.push(Diagnostic { line: l, col: 0, sev: Severity::Error, msg: ln.trim().to_string() });
+            }
+            msg_next = false; line_no = None;
+        }
+    }
+    diags
+}
+
+fn parse_colon_format(output: &str) -> Vec<Diagnostic> {
+    // path:line:col:code:message  OR  path:line:col: message
+    let mut diags = Vec::new();
+    for ln in output.lines() {
+        let parts: Vec<&str> = ln.splitn(5, ':').collect();
+        if parts.len() < 4 { continue; }
+        let line = parts[1].trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
+        let col  = parts[2].trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
+        let code_or_msg = parts[3].trim();
+        let msg  = if parts.len() >= 5 {
+            format!("{}: {}", code_or_msg, parts[4].trim())
+        } else { code_or_msg.to_string() };
+        let sev = if code_or_msg.starts_with('E') || code_or_msg.starts_with("error") {
+            Severity::Error
+        } else { Severity::Warning };
+        diags.push(Diagnostic { line, col, sev, msg });
+    }
+    diags
+}
+
+fn lint_c(tmp: &PathBuf, is_cpp: bool) -> Vec<Diagnostic> {
+    let compiler = if is_cpp { "g++" } else { "gcc" };
+    let tmp_str = tmp.to_str().unwrap_or("").to_string();
+    let out = Command::new(compiler)
+        .args(&["-fsyntax-only", "-Wall", "-Wextra", "-fno-diagnostics-color", &tmp_str])
+        .stdout(Stdio::null()).stderr(Stdio::piped()).output();
+
+    if let Ok(o) = out {
+        let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+        return parse_gcc_output(&stderr);
+    }
+    vec![]
+}
+
+fn parse_gcc_output(stderr: &str) -> Vec<Diagnostic> {
+    // gcc format:  file:line:col: error: message
+    //              file:line:col: warning: message
+    let mut diags = Vec::new();
+    for ln in stderr.lines() {
+        let parts: Vec<&str> = ln.splitn(5, ':').collect();
+        if parts.len() < 5 { continue; }
+        let line = parts[1].trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
+        let col  = parts[2].trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
+        let kind = parts[3].trim();
+        let msg  = parts[4].trim().to_string();
+        let sev = match kind {
+            "error"   => Severity::Error,
+            "warning" => Severity::Warning,
+            _ => continue,
+        };
+        diags.push(Diagnostic { line, col, sev, msg });
+    }
+    diags
+}
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  SYNTAX HIGHLIGHTING  (Rust · C · C++ · HTML · CSS · JS · Python · Lua)
@@ -692,18 +831,19 @@ struct Buffer {
     dirty: bool,
     row: usize, col: usize,
     srow: usize, scol: usize,
+    diags: Vec<Diagnostic>,
 }
 impl Buffer {
     fn empty() -> Self {
         Buffer { lines: vec![String::new()], path: None, dirty: false,
-                 row: 0, col: 0, srow: 0, scol: 0 }
+                 row: 0, col: 0, srow: 0, scol: 0, diags: vec![] }
     }
     fn from_file(path: PathBuf) -> io::Result<Self> {
         let content = fs::read_to_string(&path)?;
         let lines: Vec<String> = if content.is_empty() {
             vec![String::new()]
         } else { content.lines().map(|l| l.to_string()).collect() };
-        Ok(Buffer { lines, path: Some(path), dirty: false, row: 0, col: 0, srow: 0, scol: 0 })
+        Ok(Buffer { lines, path: Some(path), dirty: false, row: 0, col: 0, srow: 0, scol: 0, diags: vec![] })
     }
     fn save(&mut self) -> io::Result<()> {
         if let Some(ref p) = self.path { fs::write(p, self.lines.join("\n"))?; self.dirty = false; }
@@ -974,6 +1114,26 @@ impl App {
     // ── tab helpers ──────────────────────────────────────────────────────
 
     fn buf(&self) -> &Buffer { &self.tabs[self.tab_idx] }
+
+    fn lint_current(&mut self) {
+        let ext = self.buf().ext();
+        if !matches!(ext.as_str(), "py"|"c"|"h"|"cpp"|"cc"|"cxx"|"hpp") { return; }
+        let path = match self.buf().path.clone() {
+            Some(p) => p,
+            None    => return,
+        };
+        let _ = &path; // used below
+        let content = self.buf().lines.join("\n");
+        let diags = lint(&path, &content, &ext);
+        let ec = diags.iter().filter(|d| d.sev == Severity::Error).count();
+        let wc = diags.iter().filter(|d| d.sev == Severity::Warning).count();
+        self.tabs[self.tab_idx].diags = diags;
+        self.status = if ec + wc == 0 {
+            "No issues found.".into()
+        } else {
+            format!("{} error{}  {} warning{}", ec, if ec==1{""} else {"s"}, wc, if wc==1{""} else {"s"})
+        };
+    }
     fn buf_mut(&mut self) -> &mut Buffer { &mut self.tabs[self.tab_idx] }
 
     fn tab_new(&mut self, buf: Buffer) {
@@ -1221,12 +1381,22 @@ impl App {
             let is_cur = br == self.buf().row;
             let cur_bg = Color::Rgb { r: 17, g: 21, b: 36 };
             if is_cur { queue!(out, style::SetBackgroundColor(cur_bg))?; }
-            // gutter
-            let gc = if is_cur { Color::Rgb { r: 200, g: 165, b: 45 } }
-                     else { Color::Rgb { r: 52, g: 58, b: 75 } };
+            // gutter — check for diagnostics on this line
+            let diag_on_line = self.buf().diags.iter()
+                .find(|d| d.line == br);
+            let (gutter_str, gc) = if let Some(d) = diag_on_line {
+                match d.sev {
+                    Severity::Error   => (format!("{:>3}✗ ", br+1), Color::Rgb { r: 220, g: 70,  b: 70  }),
+                    Severity::Warning => (format!("{:>3}▲ ", br+1), Color::Rgb { r: 210, g: 160, b: 40  }),
+                }
+            } else if is_cur {
+                (format!("{:>4} ", br+1), Color::Rgb { r: 200, g: 165, b: 45 })
+            } else {
+                (format!("{:>4} ", br+1), Color::Rgb { r: 52,  g: 58,  b: 75  })
+            };
             queue!(out,
                 style::SetForegroundColor(gc),
-                style::Print(format!("{:>4} ", br+1)),
+                style::Print(&gutter_str),
                 style::SetForegroundColor(Color::Reset),
             )?;
             // syntax tokens
@@ -1307,23 +1477,57 @@ impl App {
 
     fn render_status(&self, out: &mut impl Write) -> io::Result<()> {
         let y = self.th - 1;
+        // Show diagnostic message for current line if one exists
+        let cur_line = self.buf().row;
+        let diag_msg = self.buf().diags.iter()
+            .find(|d| d.line == cur_line)
+            .map(|d| match d.sev {
+                Severity::Error   => format!("  ✗ {}  ", d.msg),
+                Severity::Warning => format!("  ▲ {}  ", d.msg),
+            });
         let left = if self.mode == Mode::Visual {
             if let Some(sel) = &self.sel {
                 let txt = self.buf().selected_text(sel);
                 format!("  VISUAL  {}ch  {}ln  ", txt.chars().count(), txt.lines().count().max(1))
             } else { format!("  {}  ", self.status) }
+        } else if let Some(ref dm) = diag_msg {
+            dm.clone()
         } else { format!("  {}  ", self.status) };
         let ext = self.buf().ext().to_uppercase();
         let right = format!("  {}  ", if ext.is_empty() { "TXT" } else { &ext });
         let fill = (self.tw as usize).saturating_sub(left.chars().count() + right.chars().count());
         let bar: String = format!("{}{}{}", left, " ".repeat(fill), right)
             .chars().take(self.tw as usize).collect();
+        // Status bar colour: red if errors on cur line, yellow if warnings, normal otherwise
+        let (status_bg, status_fg) = if let Some(ref dm) = diag_msg {
+            if dm.starts_with("  ✗") {
+                (Color::Rgb { r: 100, g: 18, b: 18 }, Color::Rgb { r: 255, g: 180, b: 180 })
+            } else {
+                (Color::Rgb { r: 80,  g: 55, b: 10 }, Color::Rgb { r: 255, g: 225, b: 140 })
+            }
+        } else {
+            (Color::Rgb { r: 14, g: 20, b: 42 }, Color::Rgb { r: 120, g: 145, b: 200 })
+        };
         queue!(out, cursor::MoveTo(0, y),
-            style::SetBackgroundColor(Color::Rgb { r: 14, g: 20, b: 42 }),
-            style::SetForegroundColor(Color::Rgb { r: 120, g: 145, b: 200 }),
+            style::SetBackgroundColor(status_bg),
+            style::SetForegroundColor(status_fg),
             style::Print(bar),
             style::SetBackgroundColor(Color::Reset), style::SetForegroundColor(Color::Reset),
-        )
+        )?;
+        // diag summary on right side of status (errors/warnings count)
+        let ec = self.buf().diags.iter().filter(|d| d.sev == Severity::Error).count();
+        let wc = self.buf().diags.iter().filter(|d| d.sev == Severity::Warning).count();
+        if ec + wc > 0 {
+            let summary = format!(" ✗{} ▲{} ", ec, wc);
+            let sx = (self.tw as usize).saturating_sub(right.chars().count() + summary.chars().count()) as u16;
+            queue!(out, cursor::MoveTo(sx, y),
+                style::SetBackgroundColor(if ec > 0 { Color::Rgb { r: 140, g: 30, b: 30 } } else { Color::Rgb { r: 100, g: 70, b: 10 } }),
+                style::SetForegroundColor(Color::White),
+                style::Print(&summary),
+                style::SetBackgroundColor(Color::Reset), style::SetForegroundColor(Color::Reset),
+            )?;
+        }
+        Ok(())
     }
 
     fn render_cmdline(&self, out: &mut impl Write) -> io::Result<()> {
@@ -1556,6 +1760,7 @@ impl App {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => return true,
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                 self.status = match self.buf_mut().save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) };
+                self.lint_current();
             }
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                 self.tab_new(Buffer::empty());
@@ -1597,6 +1802,7 @@ impl App {
             (KeyCode::Esc, _) => { self.mode = Mode::Normal; self.status = "NORMAL".into(); }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                 self.status = match self.buf_mut().save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) };
+                self.lint_current();
             }
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                 self.tab_new(Buffer::empty());
@@ -1732,8 +1938,13 @@ impl App {
         match parts[0] {
             "q"  => { if self.buf().dirty { self.status = "Unsaved! Use :q! or :wq".into(); return false; } return true; }
             "q!" => return true,
-            "w"  => { self.status = match self.buf_mut().save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) }; }
-            "wq" => { match self.buf_mut().save() { Ok(_) => return true, Err(e) => self.status = format!("Error: {}", e) } }
+            "w"  => {
+                self.status = match self.buf_mut().save() { Ok(_) => "Saved.".into(), Err(e) => format!("Error: {}", e) };
+                self.lint_current();
+            }
+            "wq" => {
+                match self.buf_mut().save() { Ok(_) => { self.lint_current(); return true; } Err(e) => self.status = format!("Error: {}", e) }
+            }
             "new" => { self.tab_new(Buffer::empty()); self.mode = Mode::Normal; self.status = "New tab.".into(); }
             "tabnew" | "tn" => { self.tab_new(Buffer::empty()); self.mode = Mode::Normal; self.status = "New tab.".into(); }
             "tabclose" | "tc" => { self.tab_close(); self.status = "Tab closed.".into(); }
@@ -1766,6 +1977,7 @@ impl App {
                 if self.show_term { self.mode = Mode::Terminal; }
                 self.status = if self.show_term { "Terminal opened.".into() } else { "Terminal closed.".into() };
             }
+            "lint" | "check" => { self.lint_current(); }
             _ => { self.status = format!("Unknown command: {}", cmd); }
         }
         false
